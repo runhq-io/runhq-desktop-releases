@@ -154,17 +154,23 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - name: Sign the update manifest
+      - name: Download the release's artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUNHQ_UPDATE_SIGNING_KEY: ${{ secrets.RUNHQ_UPDATE_SIGNING_KEY }}
         run: |
-          v="${{ needs.create-release.outputs.version }}"
           mkdir artifacts
-          gh release download "v$v" --repo "${{ github.repository }}" --dir artifacts
-          cd apps/desktop/scripts && npm install --no-save @noble/curves@2.4.0 && cd -
-          node apps/desktop/scripts/sign-update-manifest.mjs "$v" artifacts
-          gh release upload "v$v" artifacts/runhq-update-manifest.json artifacts/runhq-update-manifest.json.sig --repo "${{ github.repository }}" --clobber
+          gh release download "v${{ needs.create-release.outputs.version }}" --repo "${{ github.repository }}" --dir artifacts
+      # The signing key is in scope for this one step only, which runs our own
+      # script on Node built-ins: nothing is installed, no third-party code runs
+      # beside the key (scripts/sign-update-manifest.mjs).
+      - name: Sign the update manifest
+        env:
+          RUNHQ_UPDATE_SIGNING_KEY: ${{ secrets.RUNHQ_UPDATE_SIGNING_KEY }}
+        run: node apps/desktop/scripts/sign-update-manifest.mjs "${{ needs.create-release.outputs.version }}" artifacts
+      - name: Upload the signed manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "v${{ needs.create-release.outputs.version }}" artifacts/runhq-update-manifest.json artifacts/runhq-update-manifest.json.sig --repo "${{ github.repository }}" --clobber
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
