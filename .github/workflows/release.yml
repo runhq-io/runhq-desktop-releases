@@ -1,25 +1,44 @@
 name: Desktop Release
 
-# Builds the RunHQ desktop app on FREE public-repo runners by checking out the
-# private peonbot/RunHQ source. The private source is only ever pulled into the
-# ephemeral runner — it is never committed here.
+# The source of truth for .github/workflows/release.yml in the PUBLIC repo
+# peonbot/runhq-desktop-releases (docs/desktop-release.md): copy it there.
 #
-# 3-job structure (the tauri-action matrix pattern) avoids the parallel-publish
-# race AND guarantees a single failed platform never ships a partial release:
-#   create-release  -> makes a DRAFT release + computes the auto version
-#   build (matrix)  -> uploads each OS's installers + latest.json to that draft
-#   publish-release -> flips the draft to published, ONLY if all 3 builds passed
+# Builds RunHQ desktop (Electron, apps/desktop) on free public-repo runners by
+# checking out the private source. The private source only ever lives in the
+# ephemeral runner.
 #
-# Version is auto-derived as 0.1.<run_number> (CI is the single source of truth);
-# no manual version bumps, no input to type. Just run the workflow.
+#   create-release  -> a DRAFT release + the auto version 0.2.<run_number>
+#   build (matrix)  -> each OS's installers + electron-updater feed files, uploaded to the draft
+#   sign-and-publish-> a manifest of every artifact's SHA-512, signed with our Ed25519 update key,
+#                      uploaded; then the draft is published. Only if all 3 builds passed.
+#
+# Installed apps install an update only when that signature verifies against
+# the public key baked into them (apps/desktop/src/main/updateVerify.ts).
+#
+# Every action is pinned to a full commit SHA (tag in the comment): this
+# workflow holds the update signing key. The source token is not persisted in
+# the checkout's git config.
+#
+# Secrets: SOURCE_REPO_TOKEN (read the private source), RUNHQ_UPDATE_SIGNING_KEY
+# (hex Ed25519 secret key). Variables: RUNHQ_UPDATE_PUBLIC_KEY (its public key),
+# SOURCE_REPO (owner/name of the private source).
+# macOS signing/notarization (CSC_LINK, CSC_KEY_PASSWORD, APPLE_ID,
+# APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID) is used when set; without it the
+# mac build is unsigned and does not auto-update (Squirrel.Mac requires a
+# signed app), see docs/desktop-release-signing.md.
 
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: 'peonbot/RunHQ ref to build (branch, tag, or SHA)'
+        description: 'Private source ref to build (branch, tag, or SHA)'
         required: false
         default: master
+      prerelease:
+        description: 'Publish as a pre-release (a test build: not "latest", so the download page and installed apps ignore it)'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   create-release:
@@ -27,26 +46,13 @@ jobs:
     permissions:
       contents: write
     outputs:
-      release_id: ${{ steps.mk.outputs.result }}
-      app_version: ${{ steps.ver.outputs.version }}
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - id: ver
-        run: echo "version=0.1.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-      - id: mk
-        uses: actions/github-script@v7
-        with:
-          result-encoding: string
-          script: |
-            const version = "0.1.${{ github.run_number }}";
-            const { data } = await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: `v${version}`,
-              name: `RunHQ v${version}`,
-              draft: true,
-              prerelease: false,
-            });
-            return data.id;
+        run: echo "version=0.2.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "v${{ steps.ver.outputs.version }}" --repo "${{ github.repository }}" --draft ${{ inputs.prerelease && '--prerelease' || '' }} --title "RunHQ v${{ steps.ver.outputs.version }}" --notes ""
 
   build:
     needs: create-release
@@ -56,37 +62,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            args: '--target universal-apple-darwin'
-          - platform: ubuntu-22.04
-            args: ''
-          - platform: windows-latest
-            args: ''
-    runs-on: ${{ matrix.platform }}
+          - os: macos-latest
+            target: --mac --universal
+          - os: ubuntu-22.04
+            target: --linux
+          - os: windows-latest
+            target: --win
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Check out private RunHQ source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          repository: peonbot/RunHQ
+          repository: ${{ vars.SOURCE_REPO }}
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           ref: ${{ github.event.inputs.source_ref || 'master' }}
+          persist-credentials: false
 
-      - name: Install Linux deps
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-
-      - name: Install Rust (universal on macOS)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
-
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
@@ -94,7 +88,7 @@ jobs:
       - name: Build protocol package
         run: pnpm --filter @runhq/server-protocol build
 
-      - name: Write client production env (baked into the bundled webview)
+      - name: Write client production env (baked into the bundled UI)
         shell: bash
         run: |
           {
@@ -103,42 +97,75 @@ jobs:
             echo "VITE_PREVIEW_DOMAINS=tank.fish"
             echo "VITE_VAPID_PUBLIC_KEY=BP72ICOMQP0N9s56yvRPwE26WplY4N3paKw1Evtt3HrfXd3URcdQ4QrngDBb8Lvk7PIy297oT2IlhhX2vA-1wP0"
           } > client/.env.production
-          cat client/.env.production
 
-      - name: Set app version (single source of truth from create-release)
+      - name: Set app version
         shell: bash
         run: |
-          APP_VERSION="${{ needs.create-release.outputs.app_version }}"
           tmp=$(mktemp)
-          # tauri.conf.json version is authoritative for the app + updater version
-          jq --arg v "$APP_VERSION" '.version = $v' apps/desktop/src-tauri/tauri.conf.json > "$tmp" && mv "$tmp" apps/desktop/src-tauri/tauri.conf.json
-          jq --arg v "$APP_VERSION" '.version = $v' apps/desktop/package.json > "$tmp" && mv "$tmp" apps/desktop/package.json
-          echo "App version set to $APP_VERSION"
+          jq --arg v "${{ needs.create-release.outputs.version }}" '.version = $v' apps/desktop/package.json > "$tmp"
+          mv "$tmp" apps/desktop/package.json
 
-      - name: Build & upload installers to the draft release
-        uses: tauri-apps/tauri-action@v0
+      - name: Build
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/desktop
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-          includeUpdaterJson: true
-          args: ${{ matrix.args }}
+          RUNHQ_UPDATE_PUBLIC_KEY: ${{ vars.RUNHQ_UPDATE_PUBLIC_KEY }}
+        run: RUNHQ_CONSOLE_URL=https://console.runhq.io pnpm --filter @runhq/desktop build
 
-  publish-release:
+      - name: Package
+        shell: bash
+        working-directory: apps/desktop
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK && 'true' || 'false' }}
+        run: |
+          # Without an Apple certificate the mac app is signed ad hoc, which Apple
+          # Silicon requires to launch at all (it still shows as unverified).
+          extra=""
+          if [ "${{ runner.os }}" = "macOS" ] && [ -z "$CSC_LINK" ]; then extra="-c.mac.identity=-"; fi
+          npx electron-builder ${{ matrix.target }} --publish never $extra
+
+      - name: Upload to the draft release
+        shell: bash
+        working-directory: apps/desktop/release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s nullglob
+          files=( *.dmg *.zip *.exe *.AppImage *.blockmap latest*.yml )
+          gh release upload "v${{ needs.create-release.outputs.version }}" "${files[@]}" --repo "${{ github.repository }}" --clobber
+
+  sign-and-publish:
     needs: [create-release, build]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      - uses: actions/github-script@v7
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          script: |
-            await github.rest.repos.updateRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: ${{ needs.create-release.outputs.release_id }},
-              draft: false,
-            });
+          repository: ${{ vars.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ github.event.inputs.source_ref || 'master' }}
+          persist-credentials: false
+          sparse-checkout: apps/desktop/scripts
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Sign the update manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNHQ_UPDATE_SIGNING_KEY: ${{ secrets.RUNHQ_UPDATE_SIGNING_KEY }}
+        run: |
+          v="${{ needs.create-release.outputs.version }}"
+          mkdir artifacts
+          gh release download "v$v" --repo "${{ github.repository }}" --dir artifacts
+          cd apps/desktop/scripts && npm install --no-save @noble/curves@2.4.0 && cd -
+          node apps/desktop/scripts/sign-update-manifest.mjs "$v" artifacts
+          gh release upload "v$v" artifacts/runhq-update-manifest.json artifacts/runhq-update-manifest.json.sig --repo "${{ github.repository }}" --clobber
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "v${{ needs.create-release.outputs.version }}" --repo "${{ github.repository }}" --draft=false
