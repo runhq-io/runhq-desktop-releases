@@ -131,8 +131,12 @@ jobs:
           done
           # Without an Apple certificate the mac app is signed ad hoc, which Apple
           # Silicon requires to launch at all (it still shows as unverified).
+          # The hardened runtime is for notarization, which needs a Developer ID;
+          # with an ad hoc signature its library validation refuses Electron's own
+          # framework at launch, so an ad hoc build runs without it. A build with a
+          # certificate keeps the hardened runtime (electron-builder.yml).
           extra=""
-          if [ "${{ runner.os }}" = "macOS" ] && [ -z "$CSC_LINK" ]; then extra="-c.mac.identity=-"; fi
+          if [ "${{ runner.os }}" = "macOS" ] && [ -z "$CSC_LINK" ]; then extra="-c.mac.identity=- -c.mac.hardenedRuntime=false"; fi
           npx electron-builder ${{ matrix.target }} --publish never $extra
 
       - name: Upload to the draft release
