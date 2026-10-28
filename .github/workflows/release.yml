@@ -19,7 +19,8 @@ name: Desktop Release
 # workflow holds the update signing key. The source token is not persisted in
 # the checkout's git config.
 #
-# Secrets: SOURCE_REPO_TOKEN (read the private source), RUNHQ_UPDATE_SIGNING_KEY
+# Secrets: SOURCE_DEPLOY_KEY (an SSH key the private source holds as a read-only
+# deploy key: it can read that one repository and nothing else), RUNHQ_UPDATE_SIGNING_KEY
 # (hex Ed25519 secret key). Variables: RUNHQ_UPDATE_PUBLIC_KEY (its public key),
 # SOURCE_REPO (owner/name of the private source).
 # macOS signing/notarization (CSC_LINK, CSC_KEY_PASSWORD, APPLE_ID,
@@ -73,7 +74,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ vars.SOURCE_REPO }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ github.event.inputs.source_ref || 'master' }}
           persist-credentials: false
 
@@ -147,7 +148,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ vars.SOURCE_REPO }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ github.event.inputs.source_ref || 'master' }}
           persist-credentials: false
           sparse-checkout: apps/desktop/scripts
