@@ -110,7 +110,7 @@ jobs:
         shell: bash
         env:
           RUNHQ_UPDATE_PUBLIC_KEY: ${{ vars.RUNHQ_UPDATE_PUBLIC_KEY }}
-        run: RUNHQ_CONSOLE_URL=https://console.runhq.io pnpm --filter @runhq/desktop build
+        run: RUNHQ_CONSOLE_URL=https://console.runhq.io RUNHQ_WEB_APP_URL=https://app.runhq.io pnpm --filter @runhq/desktop build
 
       - name: Package
         shell: bash
