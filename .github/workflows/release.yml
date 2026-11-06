@@ -25,8 +25,9 @@ name: Desktop Release
 # SOURCE_REPO (owner/name of the private source).
 # macOS signing/notarization (CSC_LINK, CSC_KEY_PASSWORD, APPLE_ID,
 # APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID) is used when set; without it the
-# mac build is unsigned and does not auto-update (Squirrel.Mac requires a
-# signed app), see docs/desktop-release-signing.md.
+# mac build is ad hoc signed (Gatekeeper warns on first install). It auto-updates
+# either way: the app swaps its own bundle rather than use Squirrel.Mac
+# (apps/desktop/src/main/macUpdate.ts), see docs/desktop-release-signing.md.
 
 on:
   workflow_dispatch:
@@ -86,8 +87,11 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Build protocol package
-        run: pnpm --filter @runhq/server-protocol build
+      # Every workspace package the desktop app depends on (protocol, browser-kit, ...),
+      # derived from its package.json as the server's Dockerfile does, so a new one
+      # cannot be missed.
+      - name: Build workspace packages
+        run: pnpm --filter "@runhq/desktop^..." build
 
       - name: Write client production env (baked into the bundled UI)
         shell: bash
