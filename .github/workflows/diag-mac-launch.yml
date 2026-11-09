@@ -1,0 +1,62 @@
+name: diag mac launch (ticket abdffb55, temporary)
+on: push
+jobs:
+  launch:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+        version: ["0.2.45", "0.2.44", "0.2.40", "0.2.34"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install like a user
+        run: |
+          set -x
+          sw_vers; uname -m
+          cd "$RUNNER_TEMP"
+          curl -sSLo RunHQ.dmg "https://github.com/runhq-io/runhq-desktop-releases/releases/download/v${{ matrix.version }}/RunHQ-${{ matrix.version }}-universal.dmg"
+          xattr -w com.apple.quarantine "0083;$(printf %x $(date +%s));Safari;" RunHQ.dmg
+          hdiutil attach -nobrowse -mountpoint /Volumes/RunHQ RunHQ.dmg
+          ditto /Volumes/RunHQ/RunHQ.app /Applications/RunHQ.app
+          hdiutil detach /Volumes/RunHQ
+          xattr -l /Applications/RunHQ.app || true
+          codesign -dvvv /Applications/RunHQ.app 2>&1 || true
+          codesign --verify --deep --strict --verbose=4 /Applications/RunHQ.app 2>&1 || true
+          spctl -a -vvv /Applications/RunHQ.app 2>&1 || true
+          # "Open Anyway" = the user's Gatekeeper override; the closest a script gets is clearing quarantine.
+          xattr -dr com.apple.quarantine /Applications/RunHQ.app
+      - name: Launch via LaunchServices (Dock)
+        run: |
+          set -x
+          start=$(date "+%Y-%m-%d %H:%M:%S")
+          open -a /Applications/RunHQ.app
+          sleep 40
+          ps -axo pid,stat,etime,%cpu,command | grep -i "RunHQ" | grep -v grep || echo "NO RunHQ PROCESS"
+          pid=$(pgrep -x RunHQ | head -1 || true)
+          if [ -n "$pid" ]; then sample "$pid" 5 -file "$RUNNER_TEMP/sample.txt" || true; head -150 "$RUNNER_TEMP/sample.txt" || true; fi
+          osascript -e 'tell application "System Events" to get {name, visible, frontmost} of every process whose name is "RunHQ"' 2>&1 || true
+          osascript -e 'tell application "System Events" to tell process "RunHQ" to get {name, position, size} of every window' 2>&1 || true
+          lsappinfo info -only applicationtype,launchedTime,checkedin,pid RunHQ 2>&1 || true
+          lsappinfo list 2>/dev/null | grep -A12 -i runhq || true
+          screencapture -x "$RUNNER_TEMP/screen.png" || true
+          log show --style compact --start "$start" --predicate 'process CONTAINS "RunHQ" OR eventMessage CONTAINS[c] "runhq"' > "$RUNNER_TEMP/unified.log" 2>&1 || true
+          grep -iE "error|fault|denied|kill|crash|fail" "$RUNNER_TEMP/unified.log" | head -80 || true
+          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i runhq || echo "no crash reports"
+          ls -la ~/Library/Application\ Support/RunHQ 2>/dev/null || true
+          pkill -x RunHQ || true; sleep 3
+      - name: Launch binary directly with logging
+        run: |
+          set -x
+          ELECTRON_ENABLE_LOGGING=1 ELECTRON_ENABLE_STACK_DUMPING=1 /Applications/RunHQ.app/Contents/MacOS/RunHQ > "$RUNNER_TEMP/direct.log" 2>&1 &
+          sleep 30
+          ps -axo pid,stat,etime,%cpu,command | grep -i "RunHQ" | grep -v grep || echo "NO RunHQ PROCESS"
+          cat "$RUNNER_TEMP/direct.log" | head -200
+          pkill -x RunHQ || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diag-${{ matrix.os }}-${{ matrix.version }}
+          path: |
+            ${{ runner.temp }}/*.png
+            ${{ runner.temp }}/*.txt
+            ${{ runner.temp }}/*.log
