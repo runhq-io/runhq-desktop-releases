@@ -2,63 +2,48 @@ name: diag mac launch (ticket abdffb55, temporary)
 on: push
 jobs:
   launch:
+    timeout-minutes: 8
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        os: [macos-15, macos-26, macos-15-intel]
-        scenario: [quarantined-from-dmg, quarantined-from-downloads, over-old-install]
+        os: [macos-15, macos-26]
+        where: [downloads, applications]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Prepare
+      - name: Install, approved as "Open Anyway" leaves it
         run: |
           set -x
           sw_vers; uname -m
           cd "$RUNNER_TEMP"
-          dl() { curl -sSLo "$2" "https://github.com/runhq-io/runhq-desktop-releases/releases/download/v$1/RunHQ-$1-universal.dmg"; xattr -w com.apple.quarantine "0083;$(printf %x $(date +%s));Safari;" "$2"; }
-          dl 0.2.45 RunHQ.dmg
-          # The member's "Open Anyway": Gatekeeper lets this app through. A script cannot click it; turning
-          # assessments off is the nearest equivalent and keeps quarantine + translocation in play.
-          sudo spctl --global-disable 2>&1 || sudo spctl --master-disable 2>&1 || true
-          spctl --status || true
-          case "${{ matrix.scenario }}" in
-            quarantined-from-dmg)
-              hdiutil attach -nobrowse -mountpoint /Volumes/RunHQ RunHQ.dmg
-              echo "APP=/Volumes/RunHQ/RunHQ.app" >> "$GITHUB_ENV" ;;
-            quarantined-from-downloads)
-              hdiutil attach -nobrowse -mountpoint /Volumes/RunHQ RunHQ.dmg
-              mkdir -p ~/Downloads; cp -R /Volumes/RunHQ/RunHQ.app ~/Downloads/RunHQ.app
-              xattr -w com.apple.quarantine "0083;$(printf %x $(date +%s));Safari;" ~/Downloads/RunHQ.app
-              echo "APP=$HOME/Downloads/RunHQ.app" >> "$GITHUB_ENV" ;;
-            over-old-install)
-              dl 0.2.34 Old.dmg
-              hdiutil attach -nobrowse -mountpoint /Volumes/Old Old.dmg
-              ditto /Volumes/Old/RunHQ.app /Applications/RunHQ.app; hdiutil detach /Volumes/Old
-              xattr -dr com.apple.quarantine /Applications/RunHQ.app
-              open -a /Applications/RunHQ.app; sleep 25; pgrep -lf "MacOS/RunHQ" || echo "old did not start"
-              osascript -e 'quit app "RunHQ"' || true; sleep 5; pkill -x RunHQ || true; sleep 2
-              hdiutil attach -nobrowse -mountpoint /Volumes/RunHQ RunHQ.dmg
-              rm -rf /Applications/RunHQ.app; ditto /Volumes/RunHQ/RunHQ.app /Applications/RunHQ.app
-              echo "APP=/Applications/RunHQ.app" >> "$GITHUB_ENV" ;;
-          esac
-      - name: Launch via LaunchServices (Dock)
+          curl -sSLo RunHQ.dmg "https://github.com/runhq-io/runhq-desktop-releases/releases/download/v0.2.45/RunHQ-0.2.45-universal.dmg"
+          xattr -w com.apple.quarantine "0083;$(printf %x $(date +%s));Safari;" RunHQ.dmg
+          hdiutil attach -nobrowse -mountpoint /Volumes/RunHQ RunHQ.dmg
+          if [ "${{ matrix.where }}" = downloads ]; then dest="$HOME/Downloads/RunHQ.app"; mkdir -p ~/Downloads; else dest=/Applications/RunHQ.app; fi
+          ditto /Volumes/RunHQ/RunHQ.app "$dest"
+          hdiutil detach /Volumes/RunHQ
+          # 0x40 = user approved (what Open Anyway records); quarantine stays, so translocation still applies.
+          xattr -w com.apple.quarantine "00c3;$(printf %x $(date +%s));Safari;" "$dest"
+          xattr -p com.apple.quarantine "$dest"
+          echo "APP=$dest" >> "$GITHUB_ENV"
+      - name: Launch and observe
         run: |
           set -x
           start=$(date "+%Y-%m-%d %H:%M:%S")
-          open "$APP"
-          sleep 45
-          ps -axo pid,stat,etime,%cpu,command | grep -i "RunHQ" | grep -v grep | cut -c1-200 || echo "NO RunHQ PROCESS"
-          osascript -e 'tell application "System Events" to tell process "RunHQ" to get {name, position, size} of every window' 2>&1 || true
-          lsappinfo list 2>/dev/null | grep -A8 '"RunHQ"' || true
+          ( open "$APP"; echo "open returned $?" ) &
+          sleep 40
+          ps -axo pid,stat,etime,%cpu,command | grep -i "RunHQ" | grep -v grep | cut -c1-220 || echo "NO RunHQ PROCESS"
+          lsappinfo list 2>/dev/null | grep -A9 '"RunHQ"' || echo "not in lsappinfo"
           screencapture -x "$RUNNER_TEMP/screen.png" || true
           pid=$(pgrep -x RunHQ | head -1 || true)
-          if [ -n "$pid" ]; then sample "$pid" 3 -file "$RUNNER_TEMP/sample.txt" >/dev/null 2>&1 || true; sed -n '/Call graph/,/Thread_/p' "$RUNNER_TEMP/sample.txt" | head -60; fi
-          log show --style compact --start "$start" --predicate 'process CONTAINS "RunHQ" OR eventMessage CONTAINS[c] "runhq" OR process == "syspolicyd" OR process == "XprotectService"' > "$RUNNER_TEMP/unified.log" 2>&1 || true
-          grep -iE "translocat|error|fault|denied|kill|crash|fail|quit|exit" "$RUNNER_TEMP/unified.log" | grep -v "Sandbox restriction" | cut -c1-260 | head -60 || true
-          ls ~/Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i runhq || echo "no crash reports"
+          if [ -n "$pid" ]; then sample "$pid" 3 -file "$RUNNER_TEMP/sample.txt" >/dev/null 2>&1 || true; sed -n '/Call graph/,/Thread_.*$/p' "$RUNNER_TEMP/sample.txt" | head -45 | cut -c1-200; fi
+          log show --style compact --start "$start" --predicate 'process CONTAINS "RunHQ" OR eventMessage CONTAINS[c] "runhq" OR process == "syspolicyd"' > "$RUNNER_TEMP/unified.log" 2>&1 || true
+          grep -iE "translocat|syspolicy|gatekeeper|error|fault|denied|kill|crash|fail" "$RUNNER_TEMP/unified.log" | grep -v "Sandbox restriction\|MobileGestalt" | cut -c1-260 | head -50 || true
+          pkill -x RunHQ || true; pkill -x open || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: diag2-${{ matrix.os }}-${{ matrix.scenario }}
+          name: diag3-${{ matrix.os }}-${{ matrix.where }}
           path: |
             ${{ runner.temp }}/*.png
             ${{ runner.temp }}/*.txt
