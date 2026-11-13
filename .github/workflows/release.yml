@@ -1,7 +1,8 @@
 name: Desktop Release
 
 # The source of truth for .github/workflows/release.yml in the PUBLIC repo
-# peonbot/runhq-desktop-releases (docs/desktop-release.md): copy it there.
+# runhq-io/runhq-desktop-releases (docs/desktop-release.md): every release
+# (scripts/deploy-desktop.sh) syncs it there from the commit it builds.
 #
 # Builds RunHQ desktop (Electron, apps/desktop) on free public-repo runners by
 # checking out the private source. The private source only ever lives in the
@@ -11,6 +12,12 @@ name: Desktop Release
 #   build (matrix)  -> each OS's installers + electron-updater feed files, uploaded to the draft
 #   sign-and-publish-> a manifest of every artifact's SHA-512, signed with our Ed25519 update key,
 #                      uploaded; then the draft is published. Only if all 3 builds passed.
+#   store-certification -> the Windows build's Microsoft Store package (RunHQ-Store-<v>.msix,
+#                      built beside the NSIS installer) through the Windows App Certification
+#                      Kit, and a check that it carries the Partner Center identity, not the
+#                      placeholder. Nothing waits on it: a failure leaves the direct downloads released
+#                      and fails the run, which scripts/deploy-desktop.sh reports as a Store
+#                      problem (docs/desktop-microsoft-store.md).
 #
 # Installed apps install an update only when that signature verifies against
 # the public key baked into them (apps/desktop/src/main/updateVerify.ts).
@@ -28,6 +35,16 @@ name: Desktop Release
 # mac build is ad hoc signed (Gatekeeper warns on first install). It auto-updates
 # either way: the app swaps its own bundle rather than use Squirrel.Mac
 # (apps/desktop/src/main/macUpdate.ts), see docs/desktop-release-signing.md.
+#
+# The macOS job also builds the Mac App Store package from the same commit and
+# version (docs/desktop-mac-app-store.md): sandboxed, no self-updater, a signed
+# .pkg kept as the run's artifact "RunHQ-<version>-mac-app-store" for App Store
+# Connect, never a release asset. Secrets: MAS_CSC_LINK + MAS_CSC_KEY_PASSWORD
+# (Apple Distribution .p12, base64), MAS_INSTALLER_CSC_LINK +
+# MAS_INSTALLER_CSC_KEY_PASSWORD (Mac Installer Distribution .p12, base64),
+# MAS_PROVISIONING_PROFILE (the Mac App Store provisioning profile, base64).
+# Until all five are set it is skipped with a notice; if it fails, the run says
+# so but the direct-download release still publishes.
 
 on:
   workflow_dispatch:
@@ -150,8 +167,102 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           shopt -s nullglob
-          files=( *.dmg *.zip *.exe *.AppImage *.blockmap latest*.yml )
+          files=( *.dmg *.zip *.exe *.msix *.AppImage *.blockmap latest*.yml )
           gh release upload "v${{ needs.create-release.outputs.version }}" "${files[@]}" --repo "${{ github.repository }}" --clobber
+
+      # The same .msix, handed to store-certification inside this run, so that
+      # job tests exactly these bytes and needs no access to the release.
+      - name: Hand the Store package to certification
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: store-msix
+          path: apps/desktop/release/*.msix
+          if-no-files-found: error
+          retention-days: 7
+
+      # ── Mac App Store (docs/desktop-mac-app-store.md) ─────────────────────────
+      # After the direct build is uploaded, so nothing here can change or hold
+      # it back: these steps continue on error, and the last one reports a
+      # failure as the "Mac App Store" annotation scripts/deploy-desktop.sh reads.
+      - name: Mac App Store signing set up?
+        id: mas
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MAS_CSC_LINK: ${{ secrets.MAS_CSC_LINK }}
+          MAS_CSC_KEY_PASSWORD: ${{ secrets.MAS_CSC_KEY_PASSWORD }}
+          MAS_INSTALLER_CSC_LINK: ${{ secrets.MAS_INSTALLER_CSC_LINK }}
+          MAS_INSTALLER_CSC_KEY_PASSWORD: ${{ secrets.MAS_INSTALLER_CSC_KEY_PASSWORD }}
+          MAS_PROVISIONING_PROFILE: ${{ secrets.MAS_PROVISIONING_PROFILE }}
+        run: |
+          missing=()
+          for v in MAS_CSC_LINK MAS_CSC_KEY_PASSWORD MAS_INSTALLER_CSC_LINK MAS_INSTALLER_CSC_KEY_PASSWORD MAS_PROVISIONING_PROFILE; do
+            if [ -z "${!v}" ]; then missing+=("$v"); fi
+          done
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Mac App Store::Not built: secrets not set (${missing[*]}). See docs/desktop-mac-app-store.md."
+          fi
+
+      - name: Mac App Store package
+        id: mas_package
+        if: runner.os == 'macOS' && steps.mas.outputs.enabled == 'true'
+        continue-on-error: true
+        shell: bash
+        working-directory: apps/desktop
+        env:
+          CSC_LINK: ${{ secrets.MAS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAS_CSC_KEY_PASSWORD }}
+          CSC_INSTALLER_LINK: ${{ secrets.MAS_INSTALLER_CSC_LINK }}
+          CSC_INSTALLER_KEY_PASSWORD: ${{ secrets.MAS_INSTALLER_CSC_KEY_PASSWORD }}
+          MAS_PROVISIONING_PROFILE: ${{ secrets.MAS_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          # The same client build and version as the direct build; only the app
+          # code differs (no self-updater), and the build checks it is gone.
+          RUNHQ_CONSOLE_URL=https://console.runhq.io RUNHQ_WEB_APP_URL=https://app.runhq.io node scripts/build.mjs --mas
+          # StoreKit's storefront country, for the US-only "Manage plan on runhq.io" link.
+          node scripts/build-storefront.mjs
+          profile="$RUNNER_TEMP/runhq-mas.provisionprofile"
+          printf '%s' "$MAS_PROVISIONING_PROFILE" | base64 --decode > "$profile"
+          npx electron-builder --config electron-builder.mas.yml --mac mas --universal --publish never -c.mas.provisioningProfile="$profile"
+
+          # What App Store Connect would refuse, refused here first.
+          out=release/mas-universal
+          app="$out/RunHQ.app"
+          pkg="$out/RunHQ-${{ needs.create-release.outputs.version }}-mas-universal.pkg"
+          test -f "$pkg"
+          codesign --verify --deep --strict "$app"
+          signer=$(codesign -dvv "$app" 2>&1)
+          grep -q '^Authority=Apple Distribution:' <<<"$signer"
+          installer=$(pkgutil --check-signature "$pkg")
+          grep -q '3rd Party Mac Developer Installer:' <<<"$installer"
+          entitlements="$RUNNER_TEMP/runhq-mas-entitlements.plist"
+          codesign -d --entitlements - --xml "$app" > "$entitlements"
+          test "$(plutil -extract com.apple.security.app-sandbox raw "$entitlements")" = true
+          test -f "$app/Contents/embedded.provisionprofile"
+          test ! -e "$app/Contents/Resources/app-update.yml"
+          addon="$app/Contents/Resources/app.asar.unpacked/dist/native/storefront.node"
+          test "$(lipo -archs "$addon")" = "x86_64 arm64"
+          rm -f "$profile"
+          echo "MAS_PKG=apps/desktop/$pkg" >> "$GITHUB_ENV"
+
+      - name: Keep the Mac App Store package
+        if: runner.os == 'macOS' && steps.mas_package.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: RunHQ-${{ needs.create-release.outputs.version }}-mac-app-store
+          path: ${{ env.MAS_PKG }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Report a Mac App Store failure
+        if: runner.os == 'macOS' && steps.mas_package.outcome == 'failure'
+        shell: bash
+        run: echo "::error title=Mac App Store::The Mac App Store package failed; see the \"Mac App Store package\" step. The direct-download release is unaffected."
 
   sign-and-publish:
     needs: [create-release, build]
@@ -190,3 +301,114 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release edit "v${{ needs.create-release.outputs.version }}" --repo "${{ github.repository }}" --draft=false
+
+  # The Microsoft Store package (the build's store-msix artifact) through the
+  # Windows App Certification Kit, the checks Partner Center runs on upload.
+  # WACK installs what it tests, so it
+  # tests a copy signed with a throwaway certificate for the package's own
+  # Publisher; the released .msix stays unsigned (the Store signs it).
+  store-certification:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 45
+    # Reads only this run's own artifact: no access to the repository or its releases.
+    permissions:
+      actions: read
+    steps:
+      - name: Download the Store package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: store-msix
+          path: store
+      - name: Run the Windows App Certification Kit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msix = Get-ChildItem store -Filter *.msix | Select-Object -First 1
+          if (-not $msix) { throw 'The release has no .msix.' }
+          $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $appcert = Join-Path $kits 'App Certification Kit\appcert.exe'
+          if (-not (Test-Path $appcert)) { throw "The Windows App Certification Kit is not on this runner ($appcert)." }
+          $signtool = Get-ChildItem (Join-Path $kits 'bin\*\x64\signtool.exe') | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe is not on this runner.' }
+
+          # The certificate subject must be the manifest's Publisher, read from the package itself.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead($msix.FullName)
+          try {
+            $reader = New-Object IO.StreamReader($zip.GetEntry('AppxManifest.xml').Open())
+            [xml]$manifest = $reader.ReadToEnd()
+            $reader.Dispose()
+          } finally { $zip.Dispose() }
+          $publisher = $manifest.Package.Identity.Publisher
+          "Package: $($manifest.Package.Identity.Name) $($manifest.Package.Identity.Version), Publisher: $publisher"
+
+          $password = ConvertTo-SecureString -String ([guid]::NewGuid().ToString()) -Force -AsPlainText
+          $cert = New-SelfSignedCertificate -Type Custom -Subject $publisher -KeyUsage DigitalSignature `
+            -FriendlyName 'RunHQ WACK test signing' -CertStoreLocation Cert:\CurrentUser\My `
+            -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
+          $pfx = Join-Path $env:RUNNER_TEMP 'wack.pfx'
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $password | Out-Null
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\LocalMachine\TrustedPeople -Password $password | Out-Null
+          $signed = Join-Path $env:RUNNER_TEMP $msix.Name
+          Copy-Item $msix.FullName $signed
+          & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint /s My $signed
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)." }
+
+          New-Item -ItemType Directory -Force wack | Out-Null
+          $report = Join-Path (Resolve-Path wack) 'wack-report.xml'
+          & $appcert reset | Out-Null
+          & $appcert test -appxpackagepath $signed -reportoutputpath $report
+          if (-not (Test-Path $report)) { throw "appcert wrote no report (exit $LASTEXITCODE)." }
+
+          [xml]$result = Get-Content $report
+          $overall = $result.REPORT.OVERALL_RESULT
+          $lines = @("## Windows App Certification Kit: $overall", '', '| Test | Result |', '|---|---|')
+          foreach ($test in $result.SelectNodes('//REQUIREMENT/TEST')) {
+            $outcome = $test.SelectSingleNode('RESULT').InnerText.Trim()
+            if ($outcome -ne 'PASS') {
+              $messages = ($test.SelectNodes('MESSAGES/MESSAGE') | ForEach-Object { $_.TEXT }) -join ' '
+              $lines += "| $($test.NAME) | $outcome $messages |"
+            }
+          }
+          $lines -join "`n" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $lines -join "`n"
+          if ($overall -eq 'FAIL') { throw 'The Store package fails Windows App Certification (report: the wack-report artifact).' }
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wack-report
+          path: wack/
+          if-no-files-found: ignore
+      # A package is submittable only with the identity Partner Center reserved
+      # (docs/desktop-microsoft-store.md). Until it is pasted into
+      # electron-builder.yml the Publisher is CN=<nil GUID>, which Partner Center
+      # never assigns: this fails the job, so the release's .msix is marked not
+      # submittable (scripts/deploy-desktop.sh), while the direct downloads ship.
+      # Runs after certification, so WACK still reports on every release.
+      - name: Partner Center identity
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msix = Get-ChildItem store -Filter *.msix | Select-Object -First 1
+          if (-not $msix) { throw 'The release has no .msix.' }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead($msix.FullName)
+          try {
+            $reader = New-Object IO.StreamReader($zip.GetEntry('AppxManifest.xml').Open())
+            [xml]$manifest = $reader.ReadToEnd()
+            $reader.Dispose()
+          } finally { $zip.Dispose() }
+          $identity = $manifest.Package.Identity
+          if ($identity.Publisher -notmatch '^CN=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$') {
+            $why = "Publisher '$($identity.Publisher)' is not a Partner Center publisher (CN=<GUID>)."
+          } elseif ([guid]$Matches[1] -eq [guid]::Empty) {
+            $why = 'Package/Identity is still the placeholder: paste Partner Center''s Name and Publisher into apps/desktop/electron-builder.yml (appx).'
+          }
+          if ($why) {
+            "## Not submittable to the Microsoft Store`n`n$why" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            throw $why
+          }
+          "Partner Center identity: $($identity.Name), $($identity.Publisher)"
