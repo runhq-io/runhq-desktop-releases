@@ -242,7 +242,8 @@ jobs:
           grep -q '3rd Party Mac Developer Installer:' <<<"$installer"
           entitlements="$RUNNER_TEMP/runhq-mas-entitlements.plist"
           codesign -d --entitlements - --xml "$app" > "$entitlements"
-          test "$(plutil -extract com.apple.security.app-sandbox raw "$entitlements")" = true
+          # plutil reads the dots in the key as a key path: PlistBuddy takes the key whole.
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$entitlements")" = true
           test -f "$app/Contents/embedded.provisionprofile"
           test ! -e "$app/Contents/Resources/app-update.yml"
           addon="$app/Contents/Resources/app.asar.unpacked/dist/native/storefront.node"
