@@ -224,8 +224,9 @@ jobs:
           # The same client build and version as the direct build; only the app
           # code differs (no self-updater), and the build checks it is gone.
           RUNHQ_CONSOLE_URL=https://console.runhq.io RUNHQ_WEB_APP_URL=https://app.runhq.io node scripts/build.mjs --mas
-          # StoreKit's storefront country, for the US-only "Manage plan on runhq.io" link.
-          node scripts/build-storefront.mjs
+          # The native addons: StoreKit's storefront country (the US-only "Manage plan
+          # on runhq.io" link) and sign-in in an ASWebAuthenticationSession.
+          node scripts/build-native.mjs
           profile="$RUNNER_TEMP/runhq-mas.provisionprofile"
           printf '%s' "$MAS_PROVISIONING_PROFILE" | base64 --decode > "$profile"
           npx electron-builder --config electron-builder.mas.yml --mac mas --universal --publish never -c.mas.provisioningProfile="$profile"
@@ -246,8 +247,15 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$entitlements")" = true
           test -f "$app/Contents/embedded.provisionprofile"
           test ! -e "$app/Contents/Resources/app-update.yml"
-          addon="$app/Contents/Resources/app.asar.unpacked/dist/native/storefront.node"
-          test "$(lipo -archs "$addon")" = "x86_64 arm64"
+          # Both addons, universal, signed with the app. Without webauth.node the
+          # build cannot sign in through the browser at all (src/main/webAuth.ts).
+          for name in storefront webauth; do
+            addon="$app/Contents/Resources/app.asar.unpacked/dist/native/$name.node"
+            test "$(lipo -archs "$addon")" = "x86_64 arm64"
+            codesign --verify --strict "$addon"
+          done
+          # The sign-in addon links AuthenticationServices (ASWebAuthenticationSession).
+          grep -q '/AuthenticationServices.framework/' <<<"$(otool -L "$app/Contents/Resources/app.asar.unpacked/dist/native/webauth.node")"
           rm -f "$profile"
           echo "MAS_PKG=apps/desktop/$pkg" >> "$GITHUB_ENV"
 
