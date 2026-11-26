@@ -245,6 +245,14 @@ jobs:
           codesign -d --entitlements - --xml "$app" > "$entitlements"
           # plutil reads the dots in the key as a key path: PlistBuddy takes the key whole.
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$entitlements")" = true
+          # Guideline 2.4.5(i): the app uses none of these (rejection of 0.2.67), nor their usage strings.
+          # (`! cmd` never trips `set -e`, hence the explicit exit.)
+          for key in com.apple.security.device.camera com.apple.security.personal-information.location com.apple.security.files.downloads.read-write; do
+            if /usr/libexec/PlistBuddy -c "Print :$key" "$entitlements" >/dev/null 2>&1; then echo "unused entitlement $key"; exit 1; fi
+          done
+          for key in NSCameraUsageDescription NSLocationUsageDescription NSLocationWhenInUseUsageDescription; do
+            if /usr/libexec/PlistBuddy -c "Print :$key" "$app/Contents/Info.plist" >/dev/null 2>&1; then echo "unused usage string $key"; exit 1; fi
+          done
           test -f "$app/Contents/embedded.provisionprofile"
           test ! -e "$app/Contents/Resources/app-update.yml"
           # Both addons, universal, signed with the app. Without webauth.node the
