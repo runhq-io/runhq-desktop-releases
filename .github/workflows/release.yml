@@ -36,15 +36,15 @@ name: Desktop Release
 # either way: the app swaps its own bundle rather than use Squirrel.Mac
 # (apps/desktop/src/main/macUpdate.ts), see docs/desktop-release-signing.md.
 #
-# The macOS job also builds the Mac App Store package from the same commit and
-# version (docs/desktop-mac-app-store.md): sandboxed, no self-updater, a signed
-# .pkg kept as the run's artifact "RunHQ-<version>-mac-app-store" for App Store
-# Connect, never a release asset. Secrets: MAS_CSC_LINK + MAS_CSC_KEY_PASSWORD
-# (Apple Distribution .p12, base64), MAS_INSTALLER_CSC_LINK +
-# MAS_INSTALLER_CSC_KEY_PASSWORD (Mac Installer Distribution .p12, base64),
-# MAS_PROVISIONING_PROFILE (the Mac App Store provisioning profile, base64).
-# Until all five are set it is skipped with a notice; if it fails, the run says
-# so but the direct-download release still publishes.
+# Store packages are NOT built here (no Mac App Store .pkg): shipping to the Mac App
+# Store is its own manual deploy, the "Mac App Store" workflow (ci/mac-app-store.yml,
+# scripts/deploy-mac-app-store.sh, docs/desktop-mac-app-store.md), which builds the MAS
+# target of the commit this run records in its name. Releases v0.2.75 and older kept a
+# .pkg artifact; that workflow reuses it instead of building.
+
+# The source commit is in the run's name: the Mac App Store workflow reads it to build
+# exactly what release v0.2.<run number> shipped.
+run-name: Desktop Release ${{ inputs.source_ref || 'master' }}
 
 on:
   workflow_dispatch:
@@ -112,13 +112,7 @@ jobs:
 
       - name: Write client production env (baked into the bundled UI)
         shell: bash
-        run: |
-          {
-            echo "VITE_CONSOLE_URL=https://console.runhq.io"
-            echo "VITE_API_URL=https://console.runhq.io"
-            echo "VITE_PREVIEW_DOMAINS=tank.fish"
-            echo "VITE_VAPID_PUBLIC_KEY=BP72ICOMQP0N9s56yvRPwE26WplY4N3paKw1Evtt3HrfXd3URcdQ4QrngDBb8Lvk7PIy297oT2IlhhX2vA-1wP0"
-          } > client/.env.production
+        run: cp apps/desktop/ci/client.env.production client/.env.production
 
       - name: Set app version
         shell: bash
@@ -180,106 +174,6 @@ jobs:
           path: apps/desktop/release/*.msix
           if-no-files-found: error
           retention-days: 7
-
-      # ── Mac App Store (docs/desktop-mac-app-store.md) ─────────────────────────
-      # After the direct build is uploaded, so nothing here can change or hold
-      # it back: these steps continue on error, and the last one reports a
-      # failure as the "Mac App Store" annotation scripts/deploy-desktop.sh reads.
-      - name: Mac App Store signing set up?
-        id: mas
-        if: runner.os == 'macOS'
-        shell: bash
-        env:
-          MAS_CSC_LINK: ${{ secrets.MAS_CSC_LINK }}
-          MAS_CSC_KEY_PASSWORD: ${{ secrets.MAS_CSC_KEY_PASSWORD }}
-          MAS_INSTALLER_CSC_LINK: ${{ secrets.MAS_INSTALLER_CSC_LINK }}
-          MAS_INSTALLER_CSC_KEY_PASSWORD: ${{ secrets.MAS_INSTALLER_CSC_KEY_PASSWORD }}
-          MAS_PROVISIONING_PROFILE: ${{ secrets.MAS_PROVISIONING_PROFILE }}
-        run: |
-          missing=()
-          for v in MAS_CSC_LINK MAS_CSC_KEY_PASSWORD MAS_INSTALLER_CSC_LINK MAS_INSTALLER_CSC_KEY_PASSWORD MAS_PROVISIONING_PROFILE; do
-            if [ -z "${!v}" ]; then missing+=("$v"); fi
-          done
-          if [ ${#missing[@]} -eq 0 ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Mac App Store::Not built: secrets not set (${missing[*]}). See docs/desktop-mac-app-store.md."
-          fi
-
-      - name: Mac App Store package
-        id: mas_package
-        if: runner.os == 'macOS' && steps.mas.outputs.enabled == 'true'
-        continue-on-error: true
-        shell: bash
-        working-directory: apps/desktop
-        env:
-          CSC_LINK: ${{ secrets.MAS_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAS_CSC_KEY_PASSWORD }}
-          CSC_INSTALLER_LINK: ${{ secrets.MAS_INSTALLER_CSC_LINK }}
-          CSC_INSTALLER_KEY_PASSWORD: ${{ secrets.MAS_INSTALLER_CSC_KEY_PASSWORD }}
-          MAS_PROVISIONING_PROFILE: ${{ secrets.MAS_PROVISIONING_PROFILE }}
-        run: |
-          set -euo pipefail
-          # The same client build and version as the direct build; only the app
-          # code differs (no self-updater), and the build checks it is gone.
-          RUNHQ_CONSOLE_URL=https://console.runhq.io RUNHQ_WEB_APP_URL=https://app.runhq.io node scripts/build.mjs --mas
-          # The native addons: StoreKit's storefront country (the US-only "Manage plan
-          # on runhq.io" link) and sign-in in an ASWebAuthenticationSession.
-          node scripts/build-native.mjs
-          profile="$RUNNER_TEMP/runhq-mas.provisionprofile"
-          printf '%s' "$MAS_PROVISIONING_PROFILE" | base64 --decode > "$profile"
-          npx electron-builder --config electron-builder.mas.yml --mac mas --universal --publish never -c.mas.provisioningProfile="$profile"
-
-          # What App Store Connect would refuse, refused here first.
-          out=release/mas-universal
-          app="$out/RunHQ.app"
-          pkg="$out/RunHQ-${{ needs.create-release.outputs.version }}-mas-universal.pkg"
-          test -f "$pkg"
-          codesign --verify --deep --strict "$app"
-          signer=$(codesign -dvv "$app" 2>&1)
-          grep -q '^Authority=Apple Distribution:' <<<"$signer"
-          installer=$(pkgutil --check-signature "$pkg")
-          grep -q '3rd Party Mac Developer Installer:' <<<"$installer"
-          entitlements="$RUNNER_TEMP/runhq-mas-entitlements.plist"
-          codesign -d --entitlements - --xml "$app" > "$entitlements"
-          # plutil reads the dots in the key as a key path: PlistBuddy takes the key whole.
-          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$entitlements")" = true
-          # Guideline 2.4.5(i): the app uses none of these (rejection of 0.2.67), nor their usage strings.
-          # (`! cmd` never trips `set -e`, hence the explicit exit.)
-          for key in com.apple.security.device.camera com.apple.security.personal-information.location com.apple.security.files.downloads.read-write; do
-            if /usr/libexec/PlistBuddy -c "Print :$key" "$entitlements" >/dev/null 2>&1; then echo "unused entitlement $key"; exit 1; fi
-          done
-          for key in NSCameraUsageDescription NSLocationUsageDescription NSLocationWhenInUseUsageDescription; do
-            if /usr/libexec/PlistBuddy -c "Print :$key" "$app/Contents/Info.plist" >/dev/null 2>&1; then echo "unused usage string $key"; exit 1; fi
-          done
-          test -f "$app/Contents/embedded.provisionprofile"
-          test ! -e "$app/Contents/Resources/app-update.yml"
-          # Both addons, universal, signed with the app. Without webauth.node the
-          # build cannot sign in through the browser at all (src/main/webAuth.ts).
-          for name in storefront webauth; do
-            addon="$app/Contents/Resources/app.asar.unpacked/dist/native/$name.node"
-            test "$(lipo -archs "$addon")" = "x86_64 arm64"
-            codesign --verify --strict "$addon"
-          done
-          # The sign-in addon links AuthenticationServices (ASWebAuthenticationSession).
-          grep -q '/AuthenticationServices.framework/' <<<"$(otool -L "$app/Contents/Resources/app.asar.unpacked/dist/native/webauth.node")"
-          rm -f "$profile"
-          echo "MAS_PKG=apps/desktop/$pkg" >> "$GITHUB_ENV"
-
-      - name: Keep the Mac App Store package
-        if: runner.os == 'macOS' && steps.mas_package.outcome == 'success'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: RunHQ-${{ needs.create-release.outputs.version }}-mac-app-store
-          path: ${{ env.MAS_PKG }}
-          if-no-files-found: error
-          retention-days: 90
-
-      - name: Report a Mac App Store failure
-        if: runner.os == 'macOS' && steps.mas_package.outcome == 'failure'
-        shell: bash
-        run: echo "::error title=Mac App Store::The Mac App Store package failed; see the \"Mac App Store package\" step. The direct-download release is unaffected."
 
   sign-and-publish:
     needs: [create-release, build]
