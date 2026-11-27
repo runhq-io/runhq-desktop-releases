@@ -1,0 +1,245 @@
+name: Mac App Store
+
+# The source of truth for .github/workflows/mac-app-store.yml in the PUBLIC repo
+# runhq-io/runhq-desktop-releases (free runners). scripts/deploy-mac-app-store.sh
+# syncs it there and dispatches it: that script (the "mac-app-store" deploy
+# environment) is the ONLY thing that runs it. Manual dispatch only; no push, PR,
+# tag, release or schedule trigger, and nothing else in the desktop release calls it.
+#
+#   build   (macos-15, ONLY when no package exists yet): the MAS target of the release's
+#           own source commit and version, nothing else: no tests, no lint, no direct
+#           build, no matrix. Skipped when `package_run` names a run that already kept
+#           "RunHQ-<version>-mac-app-store" (releases v0.2.75 and older built it).
+#   upload  (ubuntu): the package → App Store Connect through the App Store Connect API
+#           (scripts/app-store-connect.mjs; no Mac, no Transporter, no altool), and with
+#           submit=true: wait for processing, put the build on macOS version <version>,
+#           submit it for App Review.
+#
+# Secrets: ASC_ISSUER_ID, ASC_KEY_ID, ASC_PRIVATE_KEY (an App Store Connect API key, role
+# App Manager; the .p8's text), and for `build` the MAS_* signing secrets of release.yml.
+# docs/desktop-mac-app-store.md.
+
+run-name: Mac App Store v${{ inputs.version }}${{ inputs.submit && ' + submit' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Desktop release to ship, e.g. 0.2.75 (its CFBundleVersion too)'
+        required: true
+      package_run:
+        description: 'Run that kept RunHQ-<version>-mac-app-store (reuse it, no macOS build). Blank: build it from build_ref'
+        required: false
+        default: ''
+      build_ref:
+        description: 'Private source commit release v<version> was built from (only used when package_run is blank)'
+        required: false
+        default: ''
+      tools_ref:
+        description: 'Private source commit to read scripts/app-store-connect.mjs from'
+        required: true
+      submit:
+        description: 'After the upload, attach the build to macOS version <version> and submit it for App Review'
+        type: boolean
+        default: false
+
+# One store shipment at a time; a newer dispatch replaces a queued or running one.
+concurrency:
+  group: mac-app-store
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # App Store Connect app "RunHQ" (bundle io.runhq.desktop).
+  ASC_APP_ID: '6836501842'
+
+jobs:
+  build:
+    if: inputs.package_run == ''
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Inputs
+        env:
+          VERSION: ${{ inputs.version }}
+          BUILD_REF: ${{ inputs.build_ref }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be x.y.z, got '$VERSION'"; exit 1; }
+          [[ "$BUILD_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::build_ref must be the full source commit of v$VERSION, got '$BUILD_REF'"; exit 1; }
+
+      - name: Mac App Store signing set up?
+        env:
+          MAS_CSC_LINK: ${{ secrets.MAS_CSC_LINK }}
+          MAS_CSC_KEY_PASSWORD: ${{ secrets.MAS_CSC_KEY_PASSWORD }}
+          MAS_INSTALLER_CSC_LINK: ${{ secrets.MAS_INSTALLER_CSC_LINK }}
+          MAS_INSTALLER_CSC_KEY_PASSWORD: ${{ secrets.MAS_INSTALLER_CSC_KEY_PASSWORD }}
+          MAS_PROVISIONING_PROFILE: ${{ secrets.MAS_PROVISIONING_PROFILE }}
+        run: |
+          missing=()
+          for v in MAS_CSC_LINK MAS_CSC_KEY_PASSWORD MAS_INSTALLER_CSC_LINK MAS_INSTALLER_CSC_KEY_PASSWORD MAS_PROVISIONING_PROFILE; do
+            if [ -z "${!v}" ]; then missing+=("$v"); fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then echo "::error title=Mac App Store::secrets not set: ${missing[*]} (docs/desktop-mac-app-store.md)"; exit 1; fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ inputs.build_ref }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages and the bundled UI
+        run: |
+          pnpm --filter "@runhq/desktop^..." build
+          cp apps/desktop/ci/client.env.production client/.env.production
+          pnpm --filter @runhq/server-web build
+
+      - name: Set app version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          tmp=$(mktemp)
+          jq --arg v "$VERSION" '.version = $v' apps/desktop/package.json > "$tmp"
+          mv "$tmp" apps/desktop/package.json
+
+      - name: Mac App Store package
+        working-directory: apps/desktop
+        env:
+          VERSION: ${{ inputs.version }}
+          CSC_LINK: ${{ secrets.MAS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAS_CSC_KEY_PASSWORD }}
+          CSC_INSTALLER_LINK: ${{ secrets.MAS_INSTALLER_CSC_LINK }}
+          CSC_INSTALLER_KEY_PASSWORD: ${{ secrets.MAS_INSTALLER_CSC_KEY_PASSWORD }}
+          MAS_PROVISIONING_PROFILE: ${{ secrets.MAS_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          # The app code without the self-updater (the build checks it is gone).
+          RUNHQ_CONSOLE_URL=https://console.runhq.io RUNHQ_WEB_APP_URL=https://app.runhq.io node scripts/build.mjs --mas
+          # The native addons: StoreKit's storefront country (the US-only "Manage plan
+          # on runhq.io" link) and sign-in in an ASWebAuthenticationSession.
+          node scripts/build-native.mjs
+          profile="$RUNNER_TEMP/runhq-mas.provisionprofile"
+          printf '%s' "$MAS_PROVISIONING_PROFILE" | base64 --decode > "$profile"
+          npx electron-builder --config electron-builder.mas.yml --mac mas --universal --publish never -c.mas.provisioningProfile="$profile"
+          rm -f "$profile"
+
+          # What App Store Connect would refuse, refused here first.
+          out=release/mas-universal
+          app="$out/RunHQ.app"
+          pkg="$out/RunHQ-$VERSION-mas-universal.pkg"
+          test -f "$pkg"
+          codesign --verify --deep --strict "$app"
+          signer=$(codesign -dvv "$app" 2>&1)
+          grep -q '^Authority=Apple Distribution:' <<<"$signer"
+          installer=$(pkgutil --check-signature "$pkg")
+          grep -q '3rd Party Mac Developer Installer:' <<<"$installer"
+          entitlements="$RUNNER_TEMP/runhq-mas-entitlements.plist"
+          codesign -d --entitlements - --xml "$app" > "$entitlements"
+          # plutil reads the dots in the key as a key path: PlistBuddy takes the key whole.
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$entitlements")" = true
+          # Guideline 2.4.5(i): the app uses none of these (rejection of 0.2.67), nor their usage strings.
+          # (`! cmd` never trips `set -e`, hence the explicit exit.)
+          for key in com.apple.security.device.camera com.apple.security.personal-information.location com.apple.security.files.downloads.read-write; do
+            if /usr/libexec/PlistBuddy -c "Print :$key" "$entitlements" >/dev/null 2>&1; then echo "unused entitlement $key"; exit 1; fi
+          done
+          for key in NSCameraUsageDescription NSLocationUsageDescription NSLocationWhenInUseUsageDescription; do
+            if /usr/libexec/PlistBuddy -c "Print :$key" "$app/Contents/Info.plist" >/dev/null 2>&1; then echo "unused usage string $key"; exit 1; fi
+          done
+          test -f "$app/Contents/embedded.provisionprofile"
+          test ! -e "$app/Contents/Resources/app-update.yml"
+          # Both addons, universal, signed with the app. Without webauth.node the
+          # build cannot sign in through the system sheet at all (src/main/webAuth.ts).
+          for name in storefront webauth; do
+            addon="$app/Contents/Resources/app.asar.unpacked/dist/native/$name.node"
+            test "$(lipo -archs "$addon")" = "x86_64 arm64"
+            codesign --verify --strict "$addon"
+          done
+          # The sign-in addon links AuthenticationServices (ASWebAuthenticationSession).
+          grep -q '/AuthenticationServices.framework/' <<<"$(otool -L "$app/Contents/Resources/app.asar.unpacked/dist/native/webauth.node")"
+
+      - name: Keep the Mac App Store package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: RunHQ-${{ inputs.version }}-mac-app-store
+          path: apps/desktop/release/mas-universal/RunHQ-${{ inputs.version }}-mas-universal.pkg
+          if-no-files-found: error
+          retention-days: 90
+
+  upload:
+    needs: build
+    # Runs after a successful build, or straight away when the build was skipped (reuse).
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    # Processing (submit=true waits for it) usually takes 5–30 minutes.
+    timeout-minutes: ${{ inputs.submit && 60 || 20 }}
+    permissions:
+      actions: read
+    steps:
+      - name: Inputs and App Store Connect key
+        env:
+          VERSION: ${{ inputs.version }}
+          TOOLS_REF: ${{ inputs.tools_ref }}
+          PACKAGE_RUN: ${{ inputs.package_run }}
+          HAS_ISSUER: ${{ secrets.ASC_ISSUER_ID != '' }}
+          HAS_KEY_ID: ${{ secrets.ASC_KEY_ID != '' }}
+          HAS_KEY: ${{ secrets.ASC_PRIVATE_KEY != '' }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be x.y.z, got '$VERSION'"; exit 1; }
+          [[ "$TOOLS_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::tools_ref must be a full source commit, got '$TOOLS_REF'"; exit 1; }
+          [[ "$PACKAGE_RUN" =~ ^[0-9]*$ ]] || { echo "::error::package_run must be a run id, got '$PACKAGE_RUN'"; exit 1; }
+          missing=()
+          [ "$HAS_ISSUER" = true ] || missing+=(ASC_ISSUER_ID)
+          [ "$HAS_KEY_ID" = true ] || missing+=(ASC_KEY_ID)
+          [ "$HAS_KEY" = true ] || missing+=(ASC_PRIVATE_KEY)
+          if [ ${#missing[@]} -gt 0 ]; then echo "::error title=Mac App Store::secrets not set: ${missing[*]} (docs/desktop-mac-app-store.md)"; exit 1; fi
+
+      - name: Download the package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          RUN: ${{ inputs.package_run || github.run_id }}
+        run: |
+          set -euo pipefail
+          name="RunHQ-$VERSION-mac-app-store"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN/artifacts" \
+            --jq ".artifacts[] | select(.name == \"$name\" and .expired == false) | .id" | head -n1)
+          [ -n "$id" ] || { echo "::error::run $RUN has no unexpired artifact $name"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/mas"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/mas.zip"
+          unzip -q "$RUNNER_TEMP/mas.zip" -d "$RUNNER_TEMP/mas"
+          pkg="$RUNNER_TEMP/mas/RunHQ-$VERSION-mas-universal.pkg"
+          test -f "$pkg"
+          echo "MAS_PKG=$pkg" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ inputs.tools_ref }}
+          persist-credentials: false
+          sparse-checkout: apps/desktop/scripts
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      # The API key is in scope for this one step only, which runs our own script on
+      # Node built-ins: nothing is installed, no third-party code runs beside the key.
+      - name: Upload to App Store Connect${{ inputs.submit && ' and submit for review' || '' }}
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          VERSION: ${{ inputs.version }}
+          SUBMIT: ${{ inputs.submit && '--submit' || '' }}
+        run: node apps/desktop/scripts/app-store-connect.mjs --app-id "$ASC_APP_ID" --pkg "$MAS_PKG" --version "$VERSION" $SUBMIT
